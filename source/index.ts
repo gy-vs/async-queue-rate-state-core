@@ -8,7 +8,7 @@ type Task<TaskResultType> =
 	| ((options: TaskOptions) => PromiseLike<TaskResultType>)
 	| ((options: TaskOptions) => TaskResultType);
 
-type EventName = 'active' | 'idle' | 'empty' | 'add' | 'next' | 'completed' | 'error' | 'pendingZero';
+type EventName = 'active' | 'idle' | 'empty' | 'add' | 'next' | 'completed' | 'error' | 'pendingZero' | 'rateLimit' | 'rateLimitCleared';
 
 /**
 Promise queue with concurrency control.
@@ -42,6 +42,13 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	#concurrency!: number;
 
 	#isPaused: boolean;
+
+	#rateLimited = false;
+
+	// Set while a task is being started (between the `active` event and the task's
+	// `#pending` increment), so re-entrant queue mutations don't evaluate the
+	// rate-limit state with a stale `#pending` value.
+	#isStartingTask = false;
 
 	// Use to assign a unique identifier to a promise function, if not explicitly specified
 	#idAssigner = 1n;
@@ -94,6 +101,34 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 
 	get #doesConcurrentAllowAnother(): boolean {
 		return this.#pending < this.#concurrency;
+	}
+
+	// The queue is rate limited when queued tasks could start given the
+	// concurrency limit, but are blocked because the current interval's
+	// `intervalCap` is exhausted. Tasks waiting for a concurrency slot, or an
+	// exhausted interval with nothing queued, do not count as rate limited.
+	get #isIntervalCapBlocking(): boolean {
+		return !this.#isIntervalIgnored
+			&& this.#queue.size > 0
+			&& !this.#doesIntervalAllowAnother
+			&& this.#doesConcurrentAllowAnother;
+	}
+
+	#updateRateLimitState(): void {
+		if (this.#isStartingTask) {
+			// `#pending` does not yet include the task being started. The state is
+			// evaluated once the outermost start completes instead.
+			return;
+		}
+
+		const isRateLimited = this.#isIntervalCapBlocking;
+
+		if (isRateLimited === this.#rateLimited) {
+			return;
+		}
+
+		this.#rateLimited = isRateLimited;
+		this.emit(isRateLimited ? 'rateLimit' : 'rateLimitCleared');
 	}
 
 	#next(): void {
@@ -193,18 +228,27 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					this.#intervalCount++;
 				}
 
-				this.emit('active');
-				this.#lastExecutionTime = Date.now();
-				job();
+				const wasStartingTask = this.#isStartingTask;
+				this.#isStartingTask = true;
+
+				try {
+					this.emit('active');
+					this.#lastExecutionTime = Date.now();
+					job();
+				} finally {
+					this.#isStartingTask = wasStartingTask;
+				}
 
 				if (canInitializeInterval) {
 					this.#initializeIntervalIfNeeded();
 				}
 
+				this.#updateRateLimitState();
 				return true;
 			}
 		}
 
+		this.#updateRateLimitState();
 		return false;
 	}
 
@@ -405,6 +449,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	*/
 	clear(): void {
 		this.#queue = new this.#queueClass();
+		this.#updateRateLimitState();
 	}
 
 	/**
@@ -508,6 +553,15 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	*/
 	get isPaused(): boolean {
 		return this.#isPaused;
+	}
+
+	/**
+	Whether the queue is currently rate limited.
+
+	This is `true` when tasks are waiting in the queue and the `intervalCap` of the current interval is the only thing preventing them from running. It is `false` when tasks are waiting for a concurrency slot, when no tasks are waiting, or when no `interval`/`intervalCap` is configured.
+	*/
+	get isRateLimited(): boolean {
+		return this.#rateLimited;
 	}
 }
 
