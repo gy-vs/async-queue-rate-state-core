@@ -8,7 +8,7 @@ type Task<TaskResultType> =
 	| ((options: TaskOptions) => PromiseLike<TaskResultType>)
 	| ((options: TaskOptions) => TaskResultType);
 
-type EventName = 'active' | 'idle' | 'empty' | 'add' | 'next' | 'completed' | 'error' | 'pendingZero';
+type EventName = 'active' | 'idle' | 'empty' | 'add' | 'next' | 'completed' | 'error' | 'pendingZero' | 'rateLimit' | 'rateLimitCleared';
 
 /**
 Promise queue with concurrency control.
@@ -42,6 +42,9 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	#concurrency!: number;
 
 	#isPaused: boolean;
+
+	// Whether a `rateLimit` event has been emitted without a matching `rateLimitCleared` yet.
+	#rateLimitActive = false;
 
 	// Use to assign a unique identifier to a promise function, if not explicitly specified
 	#idAssigner = 1n;
@@ -96,6 +99,48 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		return this.#pending < this.#concurrency;
 	}
 
+	// Whether the interval window is still being enforced, meaning `#intervalCount`
+	// reflects the remaining quota. When no timer is running and the window has
+	// expired, the count is stale and will be reset on the next dequeue attempt.
+	get #isIntervalWindowActive(): boolean {
+		if (this.#intervalId !== undefined || this.#timeoutId !== undefined) {
+			return true;
+		}
+
+		const now = Date.now();
+
+		if (this.#intervalEnd > now) {
+			return true;
+		}
+
+		return this.#lastExecutionTime > 0 && now - this.#lastExecutionTime < this.#interval;
+	}
+
+	// Whether queued tasks are blocked by the interval cap, as opposed to waiting
+	// for a concurrency slot or not waiting at all.
+	get #isIntervalQuotaExhausted(): boolean {
+		if (this.#isIntervalIgnored || this.#queue.size === 0 || this.#doesIntervalAllowAnother) {
+			return false;
+		}
+
+		return this.#isIntervalWindowActive;
+	}
+
+	// Emit `rateLimit`/`rateLimitCleared` on transitions only, so each continuous
+	// rate-limited period produces exactly one pair of events. The state is updated
+	// before emitting so listeners that re-enter the queue (for example, by calling
+	// `add()`) cannot trigger duplicate notifications.
+	#updateRateLimitState(): void {
+		const isRateLimited = this.#isIntervalQuotaExhausted;
+
+		if (isRateLimited === this.#rateLimitActive) {
+			return;
+		}
+
+		this.#rateLimitActive = isRateLimited;
+		this.emit(isRateLimited ? 'rateLimit' : 'rateLimitCleared');
+	}
+
 	#next(): void {
 		this.#pending--;
 
@@ -104,6 +149,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		}
 
 		this.#tryToStartAnother();
+		this.#updateRateLimitState();
 		this.emit('next');
 	}
 
@@ -238,6 +284,10 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	#processQueue(): void {
 		// eslint-disable-next-line no-empty
 		while (this.#tryToStartAnother()) {}
+
+		// Reconcile after the batch so a window that only partially drains the
+		// queue does not flap between `rateLimit` and `rateLimitCleared`.
+		this.#updateRateLimitState();
 	}
 
 	get concurrency(): number {
@@ -360,6 +410,7 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 			this.emit('add');
 
 			this.#tryToStartAnother();
+			this.#updateRateLimitState();
 		});
 	}
 
@@ -405,6 +456,9 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	*/
 	clear(): void {
 		this.#queue = new this.#queueClass();
+
+		// With no tasks waiting, the queue is no longer rate limited.
+		this.#updateRateLimitState();
 	}
 
 	/**
@@ -508,6 +562,15 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 	*/
 	get isPaused(): boolean {
 		return this.#isPaused;
+	}
+
+	/**
+	Whether the queue is currently rate limited by `intervalCap`.
+
+	This is `true` only when tasks are waiting in the queue because the interval quota is exhausted. Tasks waiting for a concurrency slot do not count as rate limited, and neither does an exhausted quota when no tasks are waiting.
+	*/
+	get isRateLimited(): boolean {
+		return this.#isIntervalQuotaExhausted;
 	}
 }
 

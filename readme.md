@@ -329,6 +329,12 @@ Number of running items (no longer in the queue).
 
 Whether the queue is currently paused.
 
+#### .isRateLimited
+
+Whether the queue is currently rate limited by `intervalCap`.
+
+This is `true` only when tasks are waiting in the queue because the interval quota is exhausted. Tasks waiting for a concurrency slot do not count as rate limited, and neither does an exhausted quota when no tasks are waiting.
+
 ## Events
 
 #### active
@@ -463,6 +469,30 @@ await job2;
 await queue.add(() => delay(600));
 //=> 'Task is completed.  Size: 0  Pending: 1'
 //=> 'Task is completed.  Size: 0  Pending: 0'
+```
+
+#### rateLimit
+
+Emitted when the queue becomes rate limited by `intervalCap`: tasks are waiting in the queue but cannot start because the interval quota is exhausted. Tasks waiting only for a concurrency slot do not trigger this event.
+
+Each continuous rate-limited period emits a single `rateLimit` event, followed by a single `rateLimitCleared` event when the quota recovers.
+
+#### rateLimitCleared
+
+Emitted when the queue stops being rate limited: the interval quota has recovered and waiting tasks can continue, or there are no tasks waiting anymore (for example, after `.clear()`).
+
+```js
+import PQueue from 'p-queue';
+
+const queue = new PQueue({intervalCap: 5, interval: 1000});
+
+queue.on('rateLimit', () => {
+	console.log('Queue is rate limited. Backing off…');
+});
+
+queue.on('rateLimitCleared', () => {
+	console.log('Rate limit cleared. Resuming…');
+});
 ```
 
 ## Advanced example
